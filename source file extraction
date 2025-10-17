@@ -1,0 +1,122 @@
+import snowflake.connector
+import csv
+import boto3 
+from botocore.exceptions import NoCredentialsError
+from datetime import datetime
+
+# Snowflake credentials
+Username = ''
+Password = ''
+Role = 'XXXXXX_OPERATORS'
+
+# S3 credentials and path
+#ACCESS_KEY = 'XXXXXXXXXXXXXXXXX'
+#SECRET_KEY = 'XXXXXXXXXXXXXXXXXXXXX'
+#BUCKET_NAME = 'XXXXXXXXXXXXXXXXXX'
+LOCAL_FILE_NAME = f"Local_output.csv"
+S3_FILE_PATH = f"LO_DELAY/Python/{LOCAL_FILE_NAME}"
+
+def check_and_notify():
+    conn = snowflake.connector.connect(
+        user=Username,
+        password=Password,
+        account='XXXXXXXXXXXXXXX.eu-west-1',
+        warehouse='XXXXXXXXXXXXXXXXXXXXXXXXX_ADHOC_XSMALL',
+        database='XXXXXXXXXXXXXXXXX_PLT2_ENV1_DWH',
+        schema='prod_daas_support',
+        role=Role
+    )
+
+    cur = conn.cursor()
+    cur.execute("""
+         WITH delayed AS (
+  SELECT
+      r.CLIENT,
+      r.COUNTRY_NAME,
+      r.LO_CONTACT,
+      r.SCHEDULED_DLVRY_END_DATE,
+      r.DS_NAME,
+      r.DS_BNDRY_ID,
+      r.DS_ID,
+      r.DLVRY_FREQUENCY,
+      r.SCHEDULED_DATA_MNTH,
+      r.ACTUAL_DATA_MNTH
+  FROM prod_daas_support.dlvry_schdl_records r
+  WHERE r.client = 'Gilead'
+AND r.SCHEDULED_DLVRY_END_DATE > TO_CHAR(CURRENT_DATE, 'MM/DD/YYYY')   
+
+    AND (r.ACTUAL_DATA_MNTH IS NULL OR TRIM(r.ACTUAL_DATA_MNTH) = '') 
+
+    AND (r.DS_ID, r.DS_BNDRY_ID) IN (
+      SELECT DS_ID, DS_BNDRY_ID
+      FROM PROD_XG9_501570_batch.EXECUTION_LOG_TBL
+      WHERE STATUS <> 'Started'
+    )
+),
+
+exploded AS (
+  SELECT
+      d.CLIENT,
+      d.COUNTRY_NAME,
+      
+LOWER(
+  COALESCE(
+    REGEXP_SUBSTR(TRIM(f.value::string), '<\\s*([^>\\s]+@[^>\\s]+)\\s*>', 1, 1, 'i', 1),
+    REGEXP_SUBSTR(TRIM(f.value::string), '([A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,})', 1, 1, 'i', 1)
+  )
+) AS LO_EMAIL,
+      d.SCHEDULED_DLVRY_END_DATE,
+      d.DS_NAME,
+      d.DS_BNDRY_ID,
+      d.DS_ID
+  FROM delayed d,
+       LATERAL FLATTEN(input => SPLIT(lo_contact, ';')) f
+  WHERE TRIM(f.value::string) <> ''
+)
+
+SELECT
+    CLIENT,
+    COUNTRY_NAME,
+    COUNT(*) AS dataset_count,
+	DS_BNDRY_ID,
+     LISTAGG(
+        DISTINCT TO_VARCHAR(DS_ID) ,
+        ', '
+  ) WITHIN GROUP (
+        ORDER BY TO_VARCHAR(DS_ID)
+    ) AS ds_id,
+    LISTAGG(DISTINCT DS_NAME, ', ')
+    WITHIN GROUP (ORDER BY DS_NAME) AS Dataset_Names,
+    LO_EMAIL AS LO_CONTACT,
+    SCHEDULED_DLVRY_END_DATE
+
+FROM exploded
+GROUP BY CLIENT, COUNTRY_NAME,DS_BNDRY_ID, LO_EMAIL, SCHEDULED_DLVRY_END_DATE
+ORDER BY COUNTRY_NAME, LO_CONTACT, SCHEDULED_DLVRY_END_DATE limit 5;
+
+    """)
+
+    rows = cur.fetchall()
+    columns = [desc[0] for desc in cur.description]
+
+    with open(LOCAL_FILE_NAME, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f, delimiter='~', quoting=csv.QUOTE_ALL)
+        writer.writerow(columns)
+        writer.writerows(rows)
+
+    cur.close()
+    conn.close()
+
+    print(f"CSV file '{LOCAL_FILE_NAME}' created successfully.")
+
+    # Upload to S3
+    try:
+        s3 = boto3.client('s3', aws_access_key_id=ACCESS_KEY,
+                          aws_secret_access_key=SECRET_KEY)
+
+        s3.upload_file(LOCAL_FILE_NAME, BUCKET_NAME, S3_FILE_PATH)
+        print(f"File uploaded to S3 at '{BUCKET_NAME}/{S3_FILE_PATH}'")
+    except NoCredentialsError:
+        print("Credentials not available for S3 upload.")
+
+check_and_notify()
