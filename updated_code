@@ -1,0 +1,346 @@
+"""
+excel_to_email.py  (pandas version — no openpyxl required)
+─────────────────────────────────────────────────────────────────────────────
+REPLACES: snowflake_extract.py  (when DB is not updated / manual data entry)
+
+HOW IT WORKS:
+  1. User fills in  delay_input.xlsx  with the required columns
+  2. pandas reads the Excel into a DataFrame  (uses the xlrd / openpyxl engine
+     that ships with pandas — no separate install needed in most IDPs)
+  3. Each DataFrame row is fed into the email template and sent via Amazon SES
+
+DEPENDENCIES (all standard in most IDP environments):
+  pandas, boto3   — no openpyxl needed directly
+
+RUN:
+  python excel_to_email.py                          # uses delay_input.xlsx
+  python excel_to_email.py --file my_data.xlsx      # custom file
+  python excel_to_email.py --dry-run                # preview without sending
+  python excel_to_email.py --sheet "Sheet2"         # pick a specific sheet
+─────────────────────────────────────────────────────────────────────────────
+"""
+
+import argparse
+import uuid
+import sys
+import os
+
+import boto3
+import pandas as pd
+
+# ── AWS / SES config  (unchanged from original send_delay_emails.py) ─────────
+ROLE_ARN     = 'arn:aws:iam::169987152393:role/PL_OA-oa-eui-sreclc-app09-dglobaldaaseu-idp_common'
+REGION       = 'us-east-1'
+SENDER_EMAIL = 'OACommunications@mail.iqvia.com'
+CC_SUPPORT   = ['BDF-HDSC-Support@iqvia.com']   # always CC'd on every alert
+
+# ── Default file / sheet ─────────────────────────────────────────────────────
+DEFAULT_EXCEL = 'delay_input.xlsx'
+DEFAULT_SHEET = 0                  # 0 = first sheet; can pass sheet name too
+
+# ── Required columns (case-insensitive — normalised on load) ─────────────────
+REQUIRED_COLUMNS = [
+    'CLIENT',
+    'COUNTRY_NAME',
+    'DATASET_COUNT',
+    'DS_BNDRY_ID',
+    'DS_ID',
+    'DS_NAME',
+    'LO_CONTACT',               # semicolon or comma-separated email(s)
+    'SCHEDULED_DLVRY_END_DATE',
+    'DELIVERY_TYPE',
+    'FILE_PATTERN',
+]
+
+# ── Email HTML template  (unchanged from original send_delay_emails.py) ──────
+EMAIL_TEMPLATE = """
+<html>
+<head></head>
+<body>
+  <p>Hi Team,</p>
+
+  <p>
+    Kindly note that the dataset(s) mentioned below are scheduled for file delivery on
+    <b>{schedule_date}</b>. However, the commencement of the process is pending due to
+    the missing input file in the DaaS input location.
+  </p>
+
+  <table border="1" cellpadding="6" cellspacing="0"
+         style="border-collapse:collapse; font-family:Arial,sans-serif; font-size:13px;">
+    <tr style="background:#f2f2f2;">
+      <th align="left">Field</th>
+      <th align="left">Details</th>
+    </tr>
+    <tr><td><b>Client</b></td>                          <td>{client}</td></tr>
+    <tr><td><b>Country</b></td>                         <td>{country}</td></tr>
+    <tr><td><b>Dataset Name(s)</b></td>                 <td>{dataset_name}</td></tr>
+    <tr><td><b>Total Datasets Affected</b></td>         <td>{dataset_count}</td></tr>
+    <tr><td><b>Delivery Type</b></td>                   <td>{delivery_type}</td></tr>
+    <tr><td><b>Source File Name / Cube Pattern</b></td> <td>{file_pattern}</td></tr>
+    <tr><td><b>Source Path (Input Directory)</b></td>   <td>{source_path}</td></tr>
+    <tr><td><b>Scheduled Delivery Date</b></td>         <td>{schedule_date}</td></tr>
+  </table>
+
+  <br>
+  <p>
+    Can you please check your end and let us know when the input file will be copied
+    for HDSC DaaS processing? We have informed the Global client about the delay and
+    we need to confirm the estimated file delivery date.
+  </p>
+
+  <p>
+    In the future, we kindly request that you provide advance notice to
+    <a href="mailto:BDF-HDSC-Support@iqvia.com">BDF-HDSC-Support@iqvia.com</a>
+    in case of any deviations from the schedule on your end. This proactive
+    communication will assist us in adjusting our delivery timeline and effectively
+    communicating with our Global clients.
+  </p>
+
+  <p>Best regards,<br>HDSC DaaS Support Team</p>
+</body>
+</html>
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_dataframe(path: str, sheet) -> pd.DataFrame:
+    """
+    Read the Excel file into a pandas DataFrame.
+
+    - Accepts .xlsx or .xls
+    - Normalises column headers to UPPER_SNAKE_CASE
+    - Drops fully empty rows
+    - Validates required columns exist
+    - Fills NaN with empty string so safe() works cleanly
+    """
+    if not os.path.exists(path):
+        print(f"✘  File not found: '{path}'")
+        print(f"   Expected columns: {REQUIRED_COLUMNS}")
+        sys.exit(1)
+
+    try:
+        df = pd.read_excel(
+            path,
+            sheet_name = sheet,   # 0 = first sheet, or pass a name string
+            dtype      = str,     # read every cell as string — no date/int surprises
+        )
+    except Exception as e:
+        print(f"✘  Could not read Excel file: {e}")
+        sys.exit(1)
+
+    # ── Normalise column headers ──────────────────────────────────────────────
+    # strip whitespace → uppercase → spaces to underscores
+    df.columns = (
+        df.columns
+          .str.strip()
+          .str.upper()
+          .str.replace(r'\s+', '_', regex=True)
+    )
+
+    # ── Drop completely blank rows ────────────────────────────────────────────
+    df.dropna(how='all', inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
+    # ── Fill remaining NaN with empty string ─────────────────────────────────
+    df.fillna('', inplace=True)
+
+    # ── Validate required columns ─────────────────────────────────────────────
+    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    if missing:
+        print(f"✘  Missing column(s) in Excel: {missing}")
+        print(f"   Columns found : {list(df.columns)}")
+        sys.exit(1)
+
+    print(f"✔  Loaded {len(df)} row(s) from '{path}' (sheet: {sheet})")
+    print(f"   Columns : {list(df.columns)}\n")
+    return df
+
+
+def safe(value: str, default: str = 'N/A') -> str:
+    """Strip and return the value; fall back to default if blank."""
+    s = str(value).strip()
+    return s if s else default
+
+
+def parse_emails(raw: str) -> list:
+    """
+    Parse a semicolon- or comma-separated email string into a clean list.
+
+    'alice@x.com; bob@y.com'  →  ['alice@x.com', 'bob@y.com']
+    'alice@x.com,bob@y.com'   →  ['alice@x.com', 'bob@y.com']
+    """
+    if not raw or str(raw).strip() in ('N/A', ''):
+        return []
+    normalised = str(raw).replace(';', ',')
+    return [
+        e.strip().strip("'\"<>")
+        for e in normalised.split(',')
+        if e.strip()
+    ]
+
+
+def assume_role(role_arn: str, region: str):
+    """Assume IAM role → return a ready-to-use SES boto3 client."""
+    session = boto3.Session()
+    sts     = session.client("sts", region_name=region)
+    try:
+        resp  = sts.assume_role(
+            RoleArn         = role_arn,
+            RoleSessionName = "excel-mail-session-" + str(uuid.uuid4())
+        )
+        creds = resp["Credentials"]
+        ses   = boto3.client(
+            "ses",
+            region_name           = region,
+            aws_access_key_id     = creds["AccessKeyId"],
+            aws_secret_access_key = creds["SecretAccessKey"],
+            aws_session_token     = creds["SessionToken"],
+        )
+        print("✔  IAM role assumed successfully.")
+        return ses
+    except Exception as e:
+        print(f"✘  ERROR assuming IAM role: {e}")
+        return None
+
+
+def send_emails(df: pd.DataFrame, ses_client) -> None:
+    """
+    Iterate over DataFrame rows and send one delay-alert email per row.
+
+    Uses itertuples() — faster than iterrows() and avoids dtype issues
+    since we loaded everything as str already.
+    """
+    sent = failed = skipped = 0
+
+    for row in df.itertuples(index=True):
+        excel_row = row.Index + 2   # +2 → matches Excel row number (1 header + 0-index)
+
+        # ── Pull fields from the row ──────────────────────────────────────────
+        client        = safe(row.CLIENT)
+        country       = safe(row.COUNTRY_NAME)
+        dataset_name  = safe(row.DS_NAME)
+        dataset_count = safe(row.DATASET_COUNT)
+        schedule_date = safe(row.SCHEDULED_DLVRY_END_DATE)
+        delivery_type = safe(row.DELIVERY_TYPE)
+        file_pattern  = safe(row.FILE_PATTERN)
+        source_path   = f"/data/input/{client}/{country}/{dataset_name}/"
+
+        # ── Parse recipient emails ────────────────────────────────────────────
+        recipients = parse_emails(row.LO_CONTACT)
+
+        # ── Subject line ──────────────────────────────────────────────────────
+        subject = (
+            f"DaaS {client} - {country} - Source file delivery delay "
+            f"[{schedule_date}]"
+        )
+
+        print(f"[Row {excel_row}] {client} | {country} | {dataset_name}")
+        print(f"           Recipients  : {recipients}")
+        print(f"           DelivType   : {delivery_type}")
+        print(f"           FilePattern : {file_pattern}")
+
+        if not recipients:
+            print(f"  → SKIP : no valid email in LO_CONTACT\n")
+            skipped += 1
+            continue
+
+        # ── Build HTML body ───────────────────────────────────────────────────
+        body_html = EMAIL_TEMPLATE.format(
+            client        = client,
+            country       = country,
+            dataset_name  = dataset_name,
+            dataset_count = dataset_count,
+            schedule_date = schedule_date,
+            delivery_type = delivery_type,
+            file_pattern  = file_pattern,
+            source_path   = source_path,
+        )
+
+        # ── Send via SES ──────────────────────────────────────────────────────
+        try:
+            ses_client.send_email(
+                Source      = SENDER_EMAIL,
+                Destination = {
+                    'ToAddresses': recipients,
+                    'CcAddresses': CC_SUPPORT,
+                },
+                Message = {
+                    'Subject': {'Data': subject},
+                    'Body':    {'Html': {'Data': body_html}},
+                }
+            )
+            print(f"  → SENT  to {', '.join(recipients)}\n")
+            sent += 1
+        except Exception as e:
+            print(f"  → FAIL  for {', '.join(recipients)}: {e}\n")
+            failed += 1
+
+    print(f"{'─'*58}")
+    print(f"  Summary :  {sent} sent  |  {failed} failed  |  {skipped} skipped")
+    print(f"{'─'*58}")
+
+
+def dry_run_preview(df: pd.DataFrame) -> None:
+    """Print a summary of what would be sent without touching SES."""
+    print("\n[DRY RUN] Emails that WOULD be sent:\n")
+    for row in df.itertuples(index=True):
+        excel_row  = row.Index + 2
+        recipients = parse_emails(row.LO_CONTACT)
+        print(
+            f"  Row {excel_row:>3} | {safe(row.CLIENT):<15} | "
+            f"{safe(row.COUNTRY_NAME):<20} | To: {recipients}"
+        )
+    print(f"\n[DRY RUN] Total rows: {len(df)} — no emails sent.")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Send DaaS delay alert emails from an Excel file via Amazon SES."
+    )
+    parser.add_argument(
+        '--file', '-f',
+        default = DEFAULT_EXCEL,
+        help    = f"Path to the Excel input file (default: {DEFAULT_EXCEL})"
+    )
+    parser.add_argument(
+        '--sheet', '-s',
+        default = DEFAULT_SHEET,
+        help    = "Sheet name or 0-based index to read (default: first sheet)"
+    )
+    parser.add_argument(
+        '--dry-run',
+        action  = 'store_true',
+        help    = "Preview what would be sent without actually sending any email."
+    )
+    args = parser.parse_args()
+
+    # ── Try to resolve sheet as integer if it looks like a number ────────────
+    try:
+        sheet = int(args.sheet)
+    except (ValueError, TypeError):
+        sheet = args.sheet          # treat as sheet name string
+
+    print(f"\n{'='*58}")
+    print(f"  Mail Automation — Excel / pandas Mode")
+    print(f"  Input file : {args.file}")
+    print(f"  Sheet      : {sheet}")
+    print(f"  Dry run    : {args.dry_run}")
+    print(f"{'='*58}\n")
+
+    # 1. Load Excel → DataFrame
+    df = load_dataframe(args.file, sheet)
+
+    # 2. Dry-run: just preview, no sending
+    if args.dry_run:
+        dry_run_preview(df)
+        sys.exit(0)
+
+    # 3. Assume IAM role → SES client
+    ses = assume_role(ROLE_ARN, REGION)
+    if not ses:
+        print("✘  Aborting — could not authenticate with AWS.")
+        sys.exit(1)
+
+    # 4. Send one email per DataFrame row
+    send_emails(df, ses)
